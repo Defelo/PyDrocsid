@@ -1,7 +1,8 @@
 import asyncio
 import threading
+from asyncio import Semaphore, Lock
 
-from functools import partial
+from functools import partial, update_wrapper, wraps
 
 
 class Thread(threading.Thread):
@@ -32,3 +33,32 @@ async def run_in_thread(func, *args, **kwargs):
         raise result
 
     return result
+
+
+async def semaphore_gather(n, *tasks):
+    semaphore = Semaphore(n)
+
+    async def inner(t):
+        async with semaphore:
+            return await t
+
+    return await asyncio.gather(*map(inner, tasks))
+
+
+class LockDeco:
+    def __init__(self, func):
+        self.lock = Lock()
+        self.func = func
+        update_wrapper(self, func)
+
+    async def __call__(self, *args, **kwargs):
+        async with self.lock:
+            return await self.func(*args, **kwargs)
+
+
+def run_as_task(func):
+    @wraps(func)
+    async def inner(*args, **kwargs):
+        asyncio.create_task(func(*args, **kwargs))
+
+    return inner

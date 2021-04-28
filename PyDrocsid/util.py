@@ -1,11 +1,71 @@
 import io
+import re
 from socket import gethostbyname, socket, AF_INET, SOCK_STREAM, timeout, SHUT_RD
 from time import time
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Union
 
-from discord import Embed, Message, File, Attachment, TextChannel, Member
+from discord import Embed, Message, File, Attachment, TextChannel, Member, User, PartialEmoji, Forbidden, Role, Guild
 from discord.abc import Messageable
-from discord.ext.commands import Command, Context, CommandError, Bot
+from discord.ext.commands import Command, Context, CommandError, Bot, BadArgument, ColorConverter
+
+from PyDrocsid.command_edit import link_response
+from PyDrocsid.config import Config
+from PyDrocsid.emojis import name_to_emoji
+from PyDrocsid.environment import REPLY, MENTION_AUTHOR
+from PyDrocsid.material_colors import MaterialColors
+from PyDrocsid.permission import BasePermission
+from PyDrocsid.settings import Settings
+from PyDrocsid.translations import t
+
+t = t.g
+
+
+class GlobalSettings(Settings):
+    prefix = "."
+
+
+def docs(text: str):
+    def deco(f):
+        f.__doc__ = text
+        return f
+
+    return deco
+
+
+async def get_prefix() -> str:
+    return await GlobalSettings.prefix.get()
+
+
+async def set_prefix(new_prefix: str):
+    await GlobalSettings.prefix.set(new_prefix)
+
+
+async def is_teamler(member: Member) -> bool:
+    return await Config.TEAMLER_LEVEL.check_permissions(member)
+
+
+class Color(ColorConverter):
+    async def convert(self, ctx, argument: str) -> Optional[int]:
+        try:
+            return await super().convert(ctx, argument)
+        except BadArgument:
+            pass
+
+        if not re.match(r"^[0-9a-fA-F]{6}$", argument):
+            raise BadArgument(t.invalid_color)
+        return int(argument, 16)
+
+
+def make_error(message, user: Union[Member, User, None] = None) -> Embed:
+    embed = Embed(title=t.error, colour=MaterialColors.error, description=str(message))
+
+    if user:
+        embed.set_author(
+            name=str(user),
+            icon_url=user.avatar_url_as(format=("gif" if user.is_avatar_animated() else "png")),
+        )
+
+    return embed
 
 
 async def can_run_command(command: Command, ctx: Context) -> bool:
@@ -15,12 +75,43 @@ async def can_run_command(command: Command, ctx: Context) -> bool:
         return False
 
 
+async def check_wastebasket(
+    message: Message,
+    member: Member,
+    emoji: PartialEmoji,
+    footer: str,
+    permission: BasePermission,
+) -> Optional[int]:
+    if emoji.name != name_to_emoji["wastebasket"]:
+        return None
+
+    for embed in message.embeds:
+        if embed.footer.text == Embed.Empty:
+            continue
+
+        pattern = re.escape(footer).replace("\\{\\}", "{}").format(r".*?#\d{4}", r"(\d+)")  # noqa: P103
+        if (match := re.match("^" + pattern + "$", embed.footer.text)) is None:
+            continue
+
+        author_id = int(match.group(1))
+        if not (author_id == member.id or await permission.check_permissions(member)):
+            try:
+                await message.remove_reaction(emoji, member)
+            except Forbidden:
+                pass
+            return None
+
+        return author_id
+
+    return None
+
+
 def measure_latency() -> Optional[float]:
     host = gethostbyname("discord.com")
     s = socket(AF_INET, SOCK_STREAM)
     s.settimeout(5)
 
-    t = time()
+    now = time()
 
     try:
         s.connect((host, 443))
@@ -28,7 +119,7 @@ def measure_latency() -> Optional[float]:
     except (timeout, OSError):
         return None
 
-    return time() - t
+    return time() - now
 
 
 def calculate_edit_distance(a: str, b: str) -> int:
@@ -56,7 +147,11 @@ def split_lines(text: str, max_size: int, *, first_max_size: Optional[int] = Non
 
 
 async def send_long_embed(
-    channel: Messageable, embed: Embed, *, repeat_title: bool = False, repeat_name: bool = False
+    channel: Messageable,
+    embed: Embed,
+    *,
+    repeat_title: bool = False,
+    repeat_name: bool = False,
 ) -> List[Message]:
     messages = []
     fields = embed.fields.copy()
@@ -65,7 +160,7 @@ async def send_long_embed(
     *parts, last = split_lines(embed.description or "", 2048) or [""]
     for part in parts:
         cur.description = part
-        messages.append(await channel.send(embed=cur))
+        messages.append(await reply(channel, embed=cur))
         if not repeat_title:
             cur.title = ""
             cur.remove_author()
@@ -77,7 +172,7 @@ async def send_long_embed(
         first_max_size = min(1024 if name or cur.fields or cur.description else 2048, 6000 - len(cur))
         *parts, last = split_lines(value, 2048, first_max_size=first_max_size)
         if len(cur.fields) >= 25 or len(cur) + len(name or "** **") + len(parts[0] if parts else last) > 6000:
-            messages.append(await channel.send(embed=cur))
+            messages.append(await reply(channel, embed=cur))
             if not repeat_title:
                 cur.title = ""
                 cur.remove_author()
@@ -89,7 +184,7 @@ async def send_long_embed(
                 cur.add_field(name=name or "** **", value=part, inline=False)
             else:
                 cur.description = part
-            messages.append(await channel.send(embed=cur))
+            messages.append(await reply(channel, embed=cur))
             if not repeat_title:
                 cur.title = ""
                 cur.remove_author()
@@ -101,7 +196,7 @@ async def send_long_embed(
             cur.add_field(name=name or "** **", value=last, inline=inline and not parts)
         else:
             cur.description = last
-    messages.append(await channel.send(embed=cur))
+    messages.append(await reply(channel, embed=cur))
     return messages
 
 
@@ -164,3 +259,29 @@ async def send_editable_log(
     embed = Embed(title=title, description=description, colour=colour if colour is not None else 0x008080)
     embed.add_field(name=name, value=value, inline=inline)
     await channel.send(embed=embed)
+
+
+async def reply(ctx: Union[Context, Message, Messageable], *args, no_reply: bool = False, **kwargs) -> Message:
+    if REPLY and isinstance(ctx, (Context, Message)) and not no_reply:
+        msg = await ctx.reply(*args, **kwargs, mention_author=MENTION_AUTHOR)
+    else:
+        msg = await (ctx.channel if isinstance(ctx, Message) else ctx).send(*args, **kwargs)
+
+    if isinstance(ctx, (Context, Message)):
+        await link_response(ctx, msg)
+
+    return msg
+
+
+def check_role_assignable(role: Role):
+    guild: Guild = role.guild
+    me: Member = guild.me
+
+    if not me.guild_permissions.manage_roles:
+        raise CommandError(t.role_assignment_error.no_permissions)
+    if role > me.top_role:
+        raise CommandError(t.role_assignment_error.higher(role, me.top_role))
+    if role == me.top_role:
+        raise CommandError(t.role_assignment_error.highest(role))
+    if role.managed or role == guild.default_role:
+        raise CommandError(t.role_assignment_error.managed_role(role))

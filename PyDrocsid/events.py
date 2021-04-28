@@ -21,9 +21,10 @@ from discord import (
     Invite,
 )
 from discord.abc import Messageable
-from discord.ext.commands import Bot, Cog
+from discord.ext.commands import Bot, Context, CommandError
 
-from PyDrocsid.command_edit import handle_command_edit
+from PyDrocsid.command_edit import handle_delete, handle_edit
+from PyDrocsid.database import db_wrapper
 from PyDrocsid.multilock import MultiLock
 
 
@@ -32,7 +33,8 @@ class StopEventHandling(Exception):
 
 
 async def extract_from_raw_reaction_event(
-    bot: Bot, event: RawReactionActionEvent
+    bot: Bot,
+    event: RawReactionActionEvent,
 ) -> Optional[Tuple[Message, PartialEmoji, Union[User, Member]]]:
     channel: Optional[Messageable] = bot.get_channel(event.channel_id)
     if channel is None:
@@ -85,20 +87,24 @@ class Events:
         await bot.process_commands(message)
 
     @staticmethod
-    async def on_message_delete(_, message: Message):
+    async def on_message_delete(bot: Bot, message: Message):
         await call_event_handlers("message_delete", message, identifier=message.id)
+        await handle_delete(bot, message.channel.id, message.id)
 
     @staticmethod
-    async def on_raw_message_delete(_, event: RawMessageDeleteEvent):
+    async def on_raw_message_delete(bot: Bot, event: RawMessageDeleteEvent):
         if event.cached_message is not None:
             return
 
         await call_event_handlers("raw_message_delete", event, identifier=event.message_id)
+        await handle_delete(bot, event.channel_id, event.message_id)
 
     @staticmethod
     async def on_message_edit(bot: Bot, before: Message, after: Message):
         await call_event_handlers("message_edit", before, after, identifier=after.id)
-        await handle_command_edit(bot, after)
+
+        if before.content != after.content:
+            await handle_edit(bot, after)
 
     @staticmethod
     async def on_raw_message_edit(bot: Bot, event: RawMessageUpdateEvent):
@@ -122,7 +128,7 @@ class Events:
         await call_event_handlers("raw_message_edit", identifier=event.message_id, prepare=prepare)
 
         if prepared:
-            await handle_command_edit(bot, prepared[0])
+            await handle_edit(bot, prepared[0])
 
     @staticmethod
     async def on_raw_reaction_add(bot: Bot, event: RawReactionActionEvent):
@@ -210,6 +216,10 @@ class Events:
     async def on_invite_delete(_, invite: Invite):
         await call_event_handlers("invite_delete", invite, identifier=invite.code)
 
+    @staticmethod
+    async def on_command_error(_, ctx: Context, error: CommandError):
+        await call_event_handlers("command_error", ctx, error, identifier=ctx.message.id)
+
 
 event_handlers = {}
 cog_instances = {}
@@ -244,19 +254,6 @@ def register_events(bot: Bot):
     for e in dir(Events):
         func = getattr(Events, e)
         if e.startswith("on_") and callable(func):
-            handler = partial(func, bot)
+            handler = partial(db_wrapper(func), bot)
             handler.__name__ = e
             bot.event(handler)
-
-
-def register_cogs(bot: Bot, *cogs):
-    register_events(bot)
-    for cog_class in cogs:
-        if cog_class is None:
-            continue
-        cog: Cog = cog_class(bot)
-        for e in dir(cog):
-            func = getattr(cog, e)
-            if e.startswith("on_") and callable(func):
-                event_handlers.setdefault(e[3:], []).append(func)
-        bot.add_cog(cog)
